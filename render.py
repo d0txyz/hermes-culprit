@@ -117,7 +117,7 @@ def render_result(result: dict) -> str:
         if tail:
             lines.append("")
             lines.append("Failure output at that step (tail):")
-            lines.append("```\n" + "\n".join(tail.splitlines()[-12:]) + "\n```")
+            lines.append("```\n" + "\n".join(tail.splitlines()[-6:]) + "\n```")
         lines.append("")
         lines.append(f"Undo only this step: /culprit revert {result['culprit']['step']}")
         if result["culprit"].get("kind") == "external":

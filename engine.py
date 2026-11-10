@@ -425,6 +425,9 @@ class Engine:
             try:
                 self._materialize(ws, row["tree"], dest)
                 outcome = self._run_test(command, dest, timeout)
+                # Show paths relative to the project, not the throwaway copy.
+                for form in (str(dest), str(dest).replace("\\", "/"), str(dest).replace("\\", "\\\\")):
+                    outcome["output"] = outcome["output"].replace(form, ".")
             finally:
                 self._cleanup(dest, self.link_dirs)
             entry = {"step": row["seq"], "tool": row["tool"], "summary": row["summary"],

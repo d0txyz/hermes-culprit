@@ -2,31 +2,35 @@
 
 **git bisect for your agent.** Culprit finds the exact tool call that broke your tests, and undoes only that one.
 
-Your agent made forty changes. The tests passed an hour ago and fail now. Which change did it? Culprit already knows every state your project went through, so it searches them for you:
+Your agent made a pile of changes. The tests passed an hour ago and fail now. Which change did it? Culprit already knows every state your project went through, so it searches them for you:
 
 ```
-> /culprit pytest -q
+> /culprit python tests/test_shop.py
 
-CULPRIT: step 23  patch: src/pricing.py
-Searched 41 states with 7 test runs in 18.4s. Last good: step 22.
+CULPRIT: step 6  patch: pricing.py
+Searched 14 states with 6 test runs in 17.4s. Last good: step 5.
 
-Test runs of `pytest -q`:
-  step  40  FAIL     2.9s  terminal: npm run format
-  step   0  PASS     2.4s  (start) first state Culprit saw
-  step  20  PASS     2.5s  write_file: src/cart.py
-  step  30  FAIL     2.7s  patch: tests/test_cart.py
-  step  25  FAIL     2.6s  write_file: README.md
-  step  22  PASS     2.5s  terminal: mkdir -p src/discounts
-  step  23  FAIL     2.8s  patch: src/pricing.py
+Test runs of `python tests/test_shop.py`:
+  step  13  FAIL     4.7s  patch: README.md
+  step   0  PASS     1.8s  (start) first state Culprit saw
+  step   6  FAIL     1.9s  patch: pricing.py
+  step   3  PASS     1.1s  patch: cart.py
+  step   4  PASS     1.7s  write_file: coupons.py
+  step   5  PASS     1.3s  patch: README.md
 
 What that step changed:
- src/pricing.py | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ pricing.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
 
-Undo only this step: /culprit revert 23
+ def apply_discount(amount, discount=0.0):
+-    return round(amount * (1 - discount), 2)
++    factor = 1 + discount
++    return round(amount * factor, 2)
+
+Undo only this step: /culprit revert 6
 ```
 
-`/culprit revert 23` then removes that one change and keeps the seventeen steps that came after it.
+That is real output from a session of 13 Hermes tool calls (`write_file` and `patch`), lightly trimmed. `/culprit revert 6` then removes that one change and keeps the seven steps that came after it.
 
 ## Why this is a plugin and not a prompt
 
@@ -42,6 +46,12 @@ The search is a binary search: 100 recorded steps need about 8 test runs, not 10
 
 ```bash
 hermes plugins install culprit
+```
+
+Or straight from this repository:
+
+```bash
+hermes plugins install d0txyz/hermes-culprit
 ```
 
 Requires `git` on your PATH (any recent version) and Hermes 0.23.0 or newer. No Python dependencies, no account, no API key, no configuration. It starts recording the next time a tool call changes a file.
