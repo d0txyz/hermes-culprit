@@ -1,0 +1,38 @@
+name: culprit
+version: "0.1.0"
+manifest_version: 2
+description: "git bisect for your agent: finds the exact tool call that broke your tests, and undoes only that one."
+author: Rizal
+license: MIT
+homepage: https://github.com/d0txyz/hermes-culprit
+tags: [debugging, bisect, snapshots, undo, testing]
+requires_hermes: ">=0.23.0"
+provides_tools:
+  - culprit_timeline
+  - culprit_bisect
+  - culprit_revert
+provides_hooks:
+  - on_session_start
+  - pre_tool_call
+  - post_tool_call
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    label: "Record snapshots"
+    description: "Take a snapshot each time a tool call changes a file. Turn off to pause recording."
+  test_timeout:
+    type: int
+    default: 300
+    label: "Test time limit (seconds)"
+    description: "Time limit for one run of the test command during a search. A run that hits it counts as a failure."
+  exclude:
+    type: list
+    default: []
+    label: "Extra excludes"
+    description: "Extra gitignore-style patterns to leave out of snapshots, on top of .gitignore and the built-in list (secrets, node_modules, virtual environments)."
+  link_dirs:
+    type: list
+    default: ["node_modules", ".venv", "venv"]
+    label: "Folders to link into test copies"
+    description: "Unsnapshotted dependency folders that are linked (not copied) into each temporary test copy so the test command can find them."
