@@ -2,6 +2,8 @@
 
 **git bisect for your agent.** Culprit finds the exact tool call that broke your tests, and undoes only that one.
 
+![Culprit naming the step that broke the tests](docs/screenshots/culprit-found.png)
+
 Your agent made a pile of changes. The tests passed an hour ago and fail now. Which change did it? Culprit already knows every state your project went through, so it searches them for you:
 
 ```
