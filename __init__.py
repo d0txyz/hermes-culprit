@@ -7,6 +7,7 @@ that step.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ import time
 from pathlib import Path
 
 from . import render
-from .engine import CulpritError, Engine
+from .engine import CulpritError, Engine, check_command
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,11 @@ _READ_ONLY = {
     "tool_describe", "culprit_timeline", "culprit_bisect", "culprit_revert",
 }
 _READ_ONLY_PREFIXES = ("web_", "browser_", "skill", "memory_", "image_", "tts_")
-_GATED = {
-    "culprit_bisect": "Culprit wants to run a test command several times in temporary copies of this folder.",
-    "culprit_revert": "Culprit wants to undo one recorded step in this folder.",
-}
+_GATED = {"culprit_bisect", "culprit_revert"}
+# Surfaces where the person typing is the owner at their own machine.
+_LOCAL_SURFACES = {"cli", "tui", "desktop", "acp"}
+# Slash subcommands that only read: open on every surface.
+_READ_ONLY_WORDS = {"", "help", "-h", "--help", "steps", "status", "list", "log", "show"}
 # After a snapshot, skip the cheap pre-call check for this long: bursts of tool calls
 # leave no room for a person to edit in between.
 _PRE_SYNC_QUIET_SECONDS = 3.0
@@ -136,13 +138,16 @@ class _Plugin:
         data_dir = self._data_dir()
         excludes = self._setting("exclude", [])
         links = self._setting("link_dirs", None)
-        key = (str(data_dir), json.dumps(excludes, default=str), json.dumps(links, default=str))
+        pass_env = self._setting("pass_env", [])
+        key = (str(data_dir), json.dumps(excludes, default=str), json.dumps(links, default=str),
+               json.dumps(pass_env, default=str))
         with self._lock:
             if self._engine is None or self._engine_key != key:
                 self._engine = Engine(
                     data_dir,
                     excludes=excludes if isinstance(excludes, list) else [],
                     link_dirs=links if isinstance(links, list) else None,
+                    pass_env=pass_env if isinstance(pass_env, list) else [],
                 )
                 self._engine_key = key
             return self._engine
@@ -157,6 +162,65 @@ class _Plugin:
             except Exception:
                 pass
         return os.getcwd()
+
+    def surface(self) -> str:
+        """The calling session's surface, or "" when Hermes cannot say."""
+        getter = getattr(self.ctx, "session_surface", None)
+        if callable(getter):
+            try:
+                return str(getter() or "").strip().lower()
+            except Exception:
+                return ""
+        return ""
+
+    def _revert_step(self, args):
+        """The step a revert call targets: the one given, else the last culprit found."""
+        step = args.get("step") if isinstance(args, dict) else None
+        if step is not None:
+            return int(step)
+        run = self.engine().last_run(self.workspace())
+        if run and run.get("culprit"):
+            return int(run["culprit"]["step"])
+        return None
+
+    def _approval(self, tool_name: str, args) -> dict:
+        """The approval directive for a model-initiated call: it shows exactly what will run."""
+        args = args if isinstance(args, dict) else {}
+        try:
+            folder = self.workspace()
+        except Exception:
+            folder = "this folder"
+        if tool_name == "culprit_bisect":
+            command = str(args.get("test_command") or "").strip()
+            try:
+                check_command(command)
+            except CulpritError as exc:
+                # The handler rejects this command without running anything.
+                return {"action": "approve", "rule_key": "culprit:bisect:rejected",
+                        "message": f"Culprit will refuse this test command and run nothing: {exc}"}
+            digest = hashlib.sha256(command.encode("utf-8")).hexdigest()[:12]
+            return {
+                "action": "approve", "rule_key": f"culprit:bisect:{digest}",
+                "message": ("Culprit wants to run this shell command several times, in temporary copies of "
+                            f"{folder}: {render.mask(command)}"),
+            }
+        try:
+            step = self._revert_step(args)
+        except (CulpritError, TypeError, ValueError):
+            step = None
+        if step is None:
+            return {"action": "approve", "rule_key": "culprit:revert:none",
+                    "message": "Culprit was asked to undo a step, but no valid step is named. Nothing will change."}
+        what = ""
+        try:
+            _prev, row = self.engine().get_step(folder, step)
+            what = f" ({render.label(row)})"
+        except Exception:
+            pass
+        return {
+            "action": "approve", "rule_key": f"culprit:revert:{step}",
+            "message": f"Culprit wants to undo step {step}{what} in {folder}, keeping later changes.",
+        }
 
     def _timeout(self, override=None) -> float:
         try:
@@ -184,7 +248,7 @@ class _Plugin:
     def pre_tool_call(self, tool_name: str = "", args=None, **kwargs):
         try:
             if tool_name in _GATED:
-                return {"action": "approve", "message": _GATED[tool_name], "rule_key": f"culprit:{tool_name}"}
+                return self._approval(tool_name, args)
             if not self._setting("enabled", True) or self._skip(tool_name):
                 return None
             ws = self.workspace()
@@ -284,8 +348,10 @@ class _Plugin:
     def tool_revert(self, args: dict, **kwargs) -> str:
         try:
             args = args if isinstance(args, dict) else {}
-            step = args.get("step")
-            done = self.engine().revert(self.workspace(), int(step) if step is not None else None,
+            step = self._revert_step(args)
+            if step is None:
+                raise CulpritError("No culprit has been found yet. Run culprit_bisect first, or give a step.")
+            done = self.engine().revert(self.workspace(), step,
                                         session=str(kwargs.get("session_id") or ""))
             return json.dumps({"ok": True, **done})
         except CulpritError as exc:
@@ -296,15 +362,44 @@ class _Plugin:
 
     # ------------------------------------------------------------ slash and CLI
 
-    def command(self, raw_args: str = "", announce=None) -> str:
+    def command(self, raw_args: str = "", announce=None, from_chat: bool = False) -> str:
         """Handle `/culprit ...` and `hermes culprit ...`. Always returns text, never raises."""
         try:
-            return self._command(str(raw_args or "").strip(), announce)
+            raw = str(raw_args or "").strip()
+            if from_chat:
+                refusal = self._chat_refusal(raw)
+                if refusal:
+                    return refusal
+            return self._command(raw, announce)
         except CulpritError as exc:
             return f"Culprit: {exc}"
         except Exception as exc:
             logger.debug("culprit command failed", exc_info=True)
             return f"Culprit hit an unexpected error: {exc}"
+
+    def _chat_refusal(self, raw: str) -> str:
+        """Outside the owner's own CLI or Desktop, /culprit may only read.
+
+        Running a test command is host shell, and revert, mark and clear change files or
+        history. On a messaging platform any admitted sender could type them, so they are
+        refused there unless the owner turns on the allow_remote_commands setting.
+        """
+        word, _, rest = raw.partition(" ")
+        word, rest = word.lower(), rest.strip()
+        if word in _READ_ONLY_WORDS and (word == "show" or not rest):
+            return ""
+        surface = self.surface()
+        if surface in _LOCAL_SURFACES:
+            return ""
+        if self._setting("allow_remote_commands", False) is True:
+            return ""
+        where = f"on {surface}" if surface else "here"
+        return (
+            f"Culprit: this command is not available {where}. Running a test command, revert, mark and "
+            "clear only work from the Hermes CLI or Desktop app on the machine itself, because they run "
+            "shell commands or change files. You can still use /culprit steps, /culprit show [step] and "
+            "/culprit help. The owner can allow this with the allow_remote_commands setting."
+        )
 
     def _command(self, raw: str, announce) -> str:
         word, _, rest = raw.partition(" ")
@@ -379,7 +474,7 @@ class _Plugin:
             except Exception:
                 handle["off"] = True
 
-        return self.command(raw_args, announce)
+        return self.command(raw_args, announce, from_chat=True)
 
 
 def _cli_setup(parser) -> None:

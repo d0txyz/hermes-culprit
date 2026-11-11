@@ -197,3 +197,47 @@ def test_linked_dependency_folder_is_never_deleted(env):
     edit(engine, ws, "calc.py", "def add(a, b):\n    return a - b\n")
     engine.bisect(str(ws), CHECK, timeout=60)
     assert (dep / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_test_command_and_git_get_a_minimal_environment(env, monkeypatch):
+    engine, ws = env
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
+    monkeypatch.setenv("GIT_SSH_COMMAND", "evil")
+    monkeypatch.setenv("MY_PROJECT_DB", "sqlite://x")
+    monkeypatch.setenv("LC_ALL", "C")
+    (ws / "dump.py").write_text(
+        "import json, os, sys\njson.dump(dict(os.environ), open(os.environ['OUT'], 'w'))\n"
+        "from calc import add\nsys.exit(0 if add(2, 2) == 4 else 1)\n", encoding="utf-8")
+    engine.sync(str(ws), kind="step", tool="write_file")
+    engine.mark(str(ws))  # search from the state that already has dump.py
+    edit(engine, ws, "calc.py", "def add(a, b):\n    return a - b\n")
+    out = ws.parent / "env.json"
+    monkeypatch.setenv("OUT", str(out))
+
+    import json
+    from engine import Engine, _git_env, minimal_env
+    allowed = Engine(ws.parent / "data", pass_env=["OUT", "MY_PROJECT_DB", "bad name", "X;rm"])
+    assert allowed.pass_env == ["OUT", "MY_PROJECT_DB"]
+    assert allowed.bisect(str(ws), f"{PY} dump.py", timeout=60)["status"] == "found"
+    seen = json.loads(out.read_text(encoding="utf-8"))
+    upper = {k.upper() for k in seen}
+    assert "OPENROUTER_API_KEY" not in upper and "ANTHROPIC_API_KEY" not in upper
+    assert "GIT_SSH_COMMAND" not in upper
+    assert seen["MY_PROJECT_DB"] == "sqlite://x" and seen["CULPRIT"] == "1"
+    assert "PATH" in upper and "LC_ALL" in upper
+
+    plain = minimal_env()
+    assert not any("API_KEY" in k.upper() or k.upper() in ("OUT", "MY_PROJECT_DB") for k in plain)
+    git_env = _git_env(ws.parent / "g", ws)
+    assert not any("API_KEY" in k.upper() for k in git_env)
+    assert "GIT_SSH_COMMAND" not in git_env and git_env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_long_or_multiline_commands_are_refused(env):
+    engine, ws = env
+    edit(engine, ws, "notes.txt", "x\n")
+    with pytest.raises(CulpritError, match="longer than"):
+        engine.bisect(str(ws), "echo " + "a" * 400)
+    with pytest.raises(CulpritError, match="single line"):
+        engine.bisect(str(ws), "echo a\necho b")

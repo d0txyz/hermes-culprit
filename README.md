@@ -81,6 +81,8 @@ You can also just ask the agent: "the build broke, find which change did it". It
 
 The same commands work outside a chat as `hermes culprit ...`.
 
+**Messaging platforms.** Running a test command is a shell command on the machine, and `revert`, `mark` and `clear` change files or history. So from Telegram, Discord and other messaging platforms `/culprit` is read-only: `steps`, `show` and `help` work, everything else is refused. The full command set works from the Hermes CLI and Desktop app. The owner can lift this with the `allow_remote_commands` setting.
+
 ## Tools for the agent
 
 | Tool | What it does | Approval |
@@ -89,7 +91,7 @@ The same commands work outside a chat as `hermes culprit ...`.
 | `culprit_bisect` | Runs the search with a test command and returns the culprit step and its diff. | Asks you first |
 | `culprit_revert` | Undoes one step, all or nothing. | Asks you first |
 
-`culprit_bisect` and `culprit_revert` go through Hermes's own approval prompt every time the model calls them. In unattended runs (cron, the gateway) where nobody can answer, Hermes declines them and nothing runs.
+`culprit_bisect` and `culprit_revert` go through Hermes's own approval prompt when the model calls them. The prompt shows the exact shell command that will run (token-like values masked) or the step that will be undone, and the folder. Answering "always" covers only that exact command or that step, never a different one the model picks later. Commands longer than 300 characters or spanning several lines are refused, so the prompt always shows the whole command. In unattended runs (cron, the gateway) where nobody can answer, Hermes declines them and nothing runs.
 
 ## Settings
 
@@ -101,6 +103,8 @@ All optional. Set them in the Desktop app under Settings, Plugins, Culprit, or i
 | `test_timeout` | `300` | Seconds allowed for one run of the test command. A run that hits the limit counts as a failure. |
 | `exclude` | `[]` | Extra gitignore-style patterns to leave out of snapshots. |
 | `link_dirs` | `[node_modules, .venv, venv]` | Unsnapshotted dependency folders linked into each temporary test copy. |
+| `pass_env` | `[]` | Names of environment variables your test command needs, for example `DATABASE_URL`. Nothing else from the Hermes environment reaches it. |
+| `allow_remote_commands` | `false` | Let `/culprit <command>`, `revert`, `mark` and `clear` run from messaging platforms. Leave off unless everyone who can message the agent may run shell commands on the machine. |
 
 ## How it works
 
@@ -122,18 +126,21 @@ It refuses to snapshot your home directory or a filesystem root.
 
 - **Network:** none. No telemetry.
 - **Subprocesses:** runs `git` (init, add, write-tree, read-tree, checkout-index, diff, apply) against its private store. During a search it runs the test command you or the agent gave it, through the system shell, in temporary folders. On Windows a timed-out test is stopped with `taskkill`.
+- **Environment:** git and the test command never inherit the Hermes environment, so provider keys and tokens do not reach your project's test code. They get an explicit minimal set: `PATH`, the home and temp folder variables, locale (`LANG`, `LC_*`), and on Windows the system variables a process needs to start (`SYSTEMROOT`, `COMSPEC`, `PATHEXT`, `APPDATA` and similar). The test command also gets the variables you name in `pass_env`, and `CULPRIT=1`.
 - **Reads outside its own data:** the contents of the files in the session's working folder, except the excluded ones above.
 - **Writes outside its own data:** only on `revert`, and only the files in the reverted step's diff. Temporary test copies go to the system temp folder and are deleted after each run.
 - **Stored data:** unencrypted copies of project files, plus for each step the tool name and the first 100 characters of its path or command (token-like values masked on a best-effort basis), in `<HERMES_HOME>/plugin-data/culprit/`. Nothing is pruned automatically; `/culprit clear` deletes a project's data.
 - **Background processes:** none.
 - **Credentials:** none read, none stored.
-- **Approvals:** model-initiated `culprit_bisect` and `culprit_revert` always go to Hermes's approval prompt. `/culprit` typed by you runs directly, because you typed the command.
+- **Approvals:** model-initiated `culprit_bisect` and `culprit_revert` go to Hermes's approval prompt, which shows the command or the step, with an approval key derived from that exact command or step. `/culprit` typed in the CLI or Desktop app runs directly, because the owner typed the command. From messaging platforms, and wherever Hermes cannot tell the surface, `/culprit` is read-only unless the owner sets `allow_remote_commands`.
 - **Hooks:** `on_session_start`, `pre_tool_call` and `post_tool_call`. They never block, rewrite or approve another tool's call. If a snapshot fails or is slow, the tool call proceeds and that snapshot is skipped.
 
 ## Limits worth knowing
 
 - The search assumes the command went from passing to failing once. If it flips back and forth (a flaky test, or a break that was fixed and re-broken), it still returns a real pass-to-fail step, but maybe not the one you care about. Use a deterministic command.
 - Test copies do not contain ignored files. If your tests need a `.env` or a build output folder, the command fails at every step and Culprit says so ("already fails at the start of the range") instead of naming a wrong step. Add the folder to `link_dirs`, or point the command at what it needs.
+- The test command sees a minimal environment. If your tests need a variable (a database URL, a feature flag), name it in `pass_env`; otherwise the command fails at every step and Culprit says so.
+- The test command must be one line of at most 300 characters. Put anything longer in a script.
 - Parallel tool calls that finish close together can be recorded as one step.
 - Only the local working folder is covered. Files changed inside a remote or container terminal backend are not seen.
 - Nested git repositories inside the project are recorded as a pointer, not by content.
@@ -143,6 +150,7 @@ It refuses to snapshot your home directory or a filesystem root.
 - **"git was not found on PATH"**: install git and restart Hermes.
 - **"Snapshots are paused"**: one snapshot took too long, usually because of a large untracked folder. Add it to `exclude` and restart Hermes.
 - **"already fails at the start of the range"**: the command never passed in the recorded history. Try `/culprit all <command>`, and check the limits above.
+- **"this command is not available"**: you ran a write command from a messaging platform. Use the CLI or Desktop app, or see `allow_remote_commands`.
 - **No steps listed**: Culprit records a step only when a tool call changes a file. Check that `enabled` is on and that Hermes was started inside the project folder.
 
 ## Development

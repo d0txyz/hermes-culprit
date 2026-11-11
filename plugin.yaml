@@ -1,5 +1,5 @@
 name: culprit
-version: "0.1.0"
+version: "0.2.0"
 manifest_version: 2
 description: "git bisect for your agent: finds the exact tool call that broke your tests, and undoes only that one."
 author: Rizal
@@ -31,6 +31,16 @@ config_schema:
     default: []
     label: "Extra excludes"
     description: "Extra gitignore-style patterns to leave out of snapshots, on top of .gitignore and the built-in list (secrets, node_modules, virtual environments)."
+  pass_env:
+    type: list
+    default: []
+    label: "Variables passed to the test command"
+    description: "Names of environment variables your test command needs (for example DATABASE_URL). The test command gets only basic system variables plus the names listed here, never the rest of the Hermes environment."
+  allow_remote_commands:
+    type: bool
+    default: false
+    label: "Allow /culprit commands from messaging platforms"
+    description: "Off by default. When off, running a test command, revert, mark and clear work only from the Hermes CLI or Desktop app. Turn on only if everyone who can message this agent may run shell commands on this machine."
   link_dirs:
     type: list
     default: ["node_modules", ".venv", "venv"]

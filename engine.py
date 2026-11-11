@@ -14,6 +14,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -46,11 +47,43 @@ def _now() -> float:
     return time.time()
 
 
+# Operating-system variables a subprocess needs to start at all. Nothing else is inherited:
+# provider keys, tokens and every other variable in the Hermes process stay out of git and
+# out of the test command, unless the user names a variable in the ``pass_env`` setting.
+_ENV_POSIX = ("PATH", "HOME", "LANG", "LANGUAGE", "TMPDIR", "TZ", "USER", "LOGNAME", "SHELL", "TERM")
+_ENV_WINDOWS = (
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS", "USERNAME",
+)
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+MAX_COMMAND_CHARS = 300
+
+
+def clean_env_names(names) -> list:
+    """Keep only well-formed variable names from a user setting."""
+    if not isinstance(names, (list, tuple)):
+        return []
+    return [n.strip() for n in names if isinstance(n, str) and _ENV_NAME.match(n.strip())]
+
+
+def minimal_env(extra_names=()) -> dict:
+    """An explicit, minimal environment: OS basics, locale, plus the names the user listed."""
+    windows = os.name == "nt"
+    base = _ENV_WINDOWS if windows else _ENV_POSIX
+    wanted = {n.upper() if windows else n for n in base}
+    wanted |= {n.upper() if windows else n for n in clean_env_names(list(extra_names))}
+    env = {}
+    for key, value in os.environ.items():
+        probe = key.upper() if windows else key
+        if probe in wanted or probe.startswith("LC_"):
+            env[key] = value
+    return env
+
+
 def _git_env(git_dir: Path, work_tree: Optional[Path], index: Optional[Path] = None) -> dict:
-    env = dict(os.environ)
-    for key in list(env):
-        if key.startswith("GIT_"):
-            env.pop(key)
+    env = minimal_env()
     env["GIT_DIR"] = str(git_dir)
     if work_tree is not None:
         env["GIT_WORK_TREE"] = str(work_tree)
@@ -76,15 +109,28 @@ def _no_window() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
+def check_command(command: str) -> None:
+    """Reject commands that could not be shown in full on one line of an approval prompt."""
+    if len(command) > MAX_COMMAND_CHARS:
+        raise CulpritError(
+            f"The test command is longer than {MAX_COMMAND_CHARS} characters. "
+            "Put it in a script file and give Culprit the command that runs the script."
+        )
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in command):
+        raise CulpritError("The test command must be a single line with no control characters.")
+
+
 class Engine:
     """One engine per plugin data directory. Safe to share across threads."""
 
     def __init__(self, data_dir: Path, excludes: Optional[list] = None,
-                 link_dirs: Optional[list] = None, git: Optional[str] = None):
+                 link_dirs: Optional[list] = None, git: Optional[str] = None,
+                 pass_env: Optional[list] = None):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.excludes = list(DEFAULT_EXCLUDES) + [str(x) for x in (excludes or []) if str(x).strip()]
         self.link_dirs = [str(x) for x in (link_dirs if link_dirs is not None else DEFAULT_LINK_DIRS)]
+        self.pass_env = clean_env_names(pass_env or [])
         self.git = git or shutil.which("git") or ""
         self._lock = threading.RLock()
         self._disabled: dict[str, str] = {}
@@ -346,14 +392,14 @@ class Engine:
             shutil.rmtree(str(path), onerror=_onerror)
 
     @staticmethod
-    def _run_test(command: str, cwd: Path, timeout: float) -> dict:
+    def _run_test(command: str, cwd: Path, timeout: float, pass_env=()) -> dict:
         started = time.monotonic()
         kwargs: dict[str, Any] = {}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | _no_window()
         else:
             kwargs["start_new_session"] = True
-        env = dict(os.environ)
+        env = minimal_env(pass_env)
         env["CULPRIT"] = "1"
         try:
             proc = subprocess.Popen(
@@ -369,7 +415,7 @@ class Engine:
             timed_out = True
             try:
                 if os.name == "nt":
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], env=minimal_env(),
                                    capture_output=True, timeout=15, creationflags=_no_window())
                 else:
                     os.killpg(proc.pid, signal.SIGKILL)
@@ -397,6 +443,7 @@ class Engine:
         command = (command or "").strip()
         if not command:
             raise CulpritError("Give a test command, for example: /culprit pytest -q")
+        check_command(command)
         started = time.monotonic()
         with self._lock:
             self.sync(ws, kind="external", summary="changes made outside tool calls", session=session)
@@ -424,7 +471,7 @@ class Engine:
             dest.mkdir()
             try:
                 self._materialize(ws, row["tree"], dest)
-                outcome = self._run_test(command, dest, timeout)
+                outcome = self._run_test(command, dest, timeout, self.pass_env)
                 # Show paths relative to the project, not the throwaway copy.
                 for form in (str(dest), str(dest).replace("\\", "/"), str(dest).replace("\\", "\\\\")):
                     outcome["output"] = outcome["output"].replace(form, ".")
